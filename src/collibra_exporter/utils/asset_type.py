@@ -10,15 +10,19 @@ import requests
 from dotenv import load_dotenv
 from functools import lru_cache
 from ..api import get_auth_header
+from .http_session_pool import HTTPSessionPool
+from .cache_manager import cached
+from .http_optimizer import make_optimized_request
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-session = requests.Session()
+# Use session pool instead of creating individual sessions
+session_pool = HTTPSessionPool()
 
-@lru_cache(maxsize=100)
+@cached(cache_type="asset_type", ttl=3600, key_prefix="asset_type_name")
 def get_asset_type_name(asset_type_id):
     """
     Get the name of an asset type by its ID.
@@ -33,16 +37,16 @@ def get_asset_type_name(asset_type_id):
     url = f"https://{base_url}/rest/2.0/assetTypes/{asset_type_id}"
 
     try:
-        session.headers.update(get_auth_header())
-        response = session.get(url)
-        response.raise_for_status()
+        # Use optimized HTTP request
+        headers = get_auth_header()
+        response = make_optimized_request(url, method='GET', headers=headers)
         json_response = response.json()
         return json_response["name"]
     except requests.RequestException as e:
         logging.error(f"Asset type not found in Collibra: {e}")
         return None
 
-@lru_cache(maxsize=1)
+@cached(cache_type="metadata", ttl=7200, key_prefix="available_asset_types")
 def get_available_asset_type():
     """
     Get all available asset types from Collibra.
@@ -55,9 +59,9 @@ def get_available_asset_type():
     url = f"https://{base_url}/rest/2.0/assetTypes"
 
     try:
-        session.headers.update(get_auth_header())
-        response = session.get(url)
-        response.raise_for_status()
+        # Use optimized HTTP request
+        headers = get_auth_header()
+        response = make_optimized_request(url, method='GET', headers=headers)
         original_results = response.json()["results"]
         modified_results = [{"id": asset["id"], "name": asset["name"]} for asset in original_results]
         

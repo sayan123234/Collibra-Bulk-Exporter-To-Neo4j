@@ -11,7 +11,13 @@ import sys
 from dotenv import load_dotenv
 from collibra_exporter import (
     setup_logging,
-    process_all_asset_types
+    process_all_asset_types,
+    clear_all_caches,
+    log_cache_stats,
+    warm_caches,
+    log_performance_summary,
+    log_http_performance,
+    cleanup_connections
 )
 from collibra_exporter.models.exporter import create_neo4j_exporter_from_env
 
@@ -70,6 +76,12 @@ def main():
             logger.error(f"Error loading configuration file: {str(e)}")
             sys.exit(1)
         
+        # Warm caches for better performance
+        logger.info("Warming caches for optimal performance...")
+        cache_warming_results = warm_caches(asset_type_ids)
+        logger.info(f"Cache warming completed - Asset types: {cache_warming_results['asset_types_cached']}, "
+                   f"Metadata: {cache_warming_results['metadata_cached']}")
+        
         # Process all asset types and export to Neo4j
         logger.info("Starting Collibra to Neo4j export process...")
         successful_exports, failed_exports, total_time = process_all_asset_types(
@@ -93,6 +105,11 @@ def main():
         
         logger.info("="*60)
         
+        # Log performance, cache, and HTTP summaries
+        log_performance_summary()
+        log_cache_stats()
+        log_http_performance()
+        
         # Return exit code based on success/failure
         if failed_exports > 0 and successful_exports == 0:
             return 1  # Complete failure
@@ -106,6 +123,11 @@ def main():
     except Exception as e:
         logger.exception("Fatal error in main program")
         return 1
+    finally:
+        # Clean up all connections and caches before exit
+        logger.info("Cleaning up connections and caches...")
+        cleanup_connections()
+        clear_all_caches()
 
 if __name__ == "__main__":
     sys.exit(main())

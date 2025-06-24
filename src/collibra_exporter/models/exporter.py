@@ -6,19 +6,91 @@ This module provides functionality for exporting flattened Collibra data to Neo4
 
 import os
 import logging
+import threading
 from typing import Dict, List, Any, Optional
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 import re
+from contextlib import contextmanager
+from ..utils.performance_monitor import start_timer, stop_timer, increment_counter
 
 logger = logging.getLogger(__name__)
 
+class Neo4jConnectionPool:
+    """Thread-safe Neo4j connection pool manager."""
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        if not hasattr(self, 'initialized'):
+            self.drivers = {}
+            self.driver_lock = threading.Lock()
+            self.initialized = True
+    
+    def get_driver(self, uri: str, username: str, password: str, database: str = "neo4j"):
+        """
+        Get or create a Neo4j driver with connection pooling.
+        
+        Args:
+            uri: Neo4j connection URI
+            username: Neo4j username
+            password: Neo4j password
+            database: Neo4j database name
+            
+        Returns:
+            Neo4j driver instance
+        """
+        driver_key = f"{uri}:{username}:{database}"
+        
+        with self.driver_lock:
+            if driver_key not in self.drivers:
+                logger.info(f"Creating new Neo4j driver for {uri}")
+                increment_counter("neo4j_drivers_created")
+                
+                self.drivers[driver_key] = GraphDatabase.driver(
+                    uri, 
+                    auth=(username, password),
+                    max_connection_lifetime=3600,  # 1 hour
+                    max_connection_pool_size=50,   # Increased pool size
+                    connection_acquisition_timeout=60,  # 60 seconds timeout
+                    keep_alive=True
+                )
+                logger.info(f"Neo4j driver created with connection pooling")
+            else:
+                logger.debug(f"Reusing existing Neo4j driver for {uri}")
+                increment_counter("neo4j_drivers_reused")
+        
+        return self.drivers[driver_key], database
+    
+    def close_all(self):
+        """Close all drivers in the pool."""
+        with self.driver_lock:
+            for driver_key, driver in self.drivers.items():
+                try:
+                    driver.close()
+                    logger.info(f"Closed Neo4j driver: {driver_key}")
+                except Exception as e:
+                    logger.warning(f"Error closing driver {driver_key}: {e}")
+            self.drivers.clear()
+    
+    def __del__(self):
+        """Cleanup when the pool is destroyed."""
+        self.close_all()
+
 class Neo4jExporter:
-    """Handles exporting flattened Collibra data to Neo4j database."""
+    """Handles exporting flattened Collibra data to Neo4j database with connection pooling."""
     
     def __init__(self, uri: str, username: str, password: str, database: str = "neo4j"):
         """
-        Initialize Neo4j connection.
+        Initialize Neo4j connection using connection pool.
         
         Args:
             uri: Neo4j connection URI
@@ -26,19 +98,41 @@ class Neo4jExporter:
             password: Neo4j password
             database: Neo4j database name
         """
-        self.driver = GraphDatabase.driver(uri, auth=(username, password))
-        self.database = database
+        self.pool = Neo4jConnectionPool()
+        self.driver, self.database = self.pool.get_driver(uri, username, password, database)
+        self.uri = uri
+        self.username = username
+        self.password = password
         
     def close(self):
-        """Close the Neo4j driver connection."""
-        if self.driver:
-            self.driver.close()
+        """Connection pool manages connections, so this is a no-op."""
+        # Connection pool manages the lifecycle, so we don't close individual connections
+        pass
     
     def __enter__(self):
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+    
+    @contextmanager
+    def get_session(self):
+        """
+        Get a database session with proper resource management.
+        
+        Yields:
+            Neo4j session
+        """
+        session = None
+        try:
+            session = self.driver.session(database=self.database)
+            yield session
+        except Exception as e:
+            logger.error(f"Error with Neo4j session: {e}")
+            raise
+        finally:
+            if session:
+                session.close()
     
     def _sanitize_property_name(self, name: str) -> str:
         """
@@ -277,7 +371,7 @@ class Neo4jExporter:
             bool: True if export successful, False otherwise
         """
         try:
-            with self.driver.session(database=self.database) as session:
+            with self.get_session() as session:
                 return session.execute_write(self._export_transaction, flattened_data, asset_type_name)
         except Exception as e:
             logger.error(f"Error exporting to Neo4j: {str(e)}")
@@ -372,6 +466,147 @@ class Neo4jExporter:
             logger.error(f"Error in export transaction: {str(e)}")
             return False
     
+    def export_batch_to_neo4j(self, flattened_batch: List[Dict[str, Any]], asset_type_name: str) -> tuple:
+        """
+        Export a batch of flattened data to Neo4j database in a single transaction.
+        
+        Args:
+            flattened_batch: List of flattened asset data dictionaries
+            asset_type_name: Name of the asset type
+            
+        Returns:
+            tuple: (successful_exports, failed_exports)
+        """
+        if not flattened_batch:
+            return 0, 0
+            
+        try:
+            with self.get_session() as session:
+                return session.execute_write(self._export_batch_transaction, flattened_batch, asset_type_name)
+        except Exception as e:
+            logger.error(f"Error exporting batch to Neo4j: {str(e)}")
+            return 0, len(flattened_batch)
+    
+    def _export_batch_transaction(self, tx, flattened_batch: List[Dict[str, Any]], asset_type_name: str) -> tuple:
+        """
+        Execute the batch export transaction.
+        
+        Args:
+            tx: Neo4j transaction
+            flattened_batch: List of flattened asset data
+            asset_type_name: Asset type name
+            
+        Returns:
+            tuple: (successful_exports, failed_exports)
+        """
+        successful_exports = 0
+        failed_exports = 0
+        
+        logger.info(f"Starting batch export of {len(flattened_batch)} assets for {asset_type_name}")
+        
+        for idx, flattened_data in enumerate(flattened_batch, 1):
+            try:
+                if self._export_single_asset_in_transaction(tx, flattened_data, asset_type_name):
+                    successful_exports += 1
+                    logger.debug(f"[{idx}/{len(flattened_batch)}] Successfully exported asset in batch")
+                else:
+                    failed_exports += 1
+                    logger.debug(f"[{idx}/{len(flattened_batch)}] Failed to export asset in batch")
+            except Exception as e:
+                failed_exports += 1
+                logger.error(f"[{idx}/{len(flattened_batch)}] Error in batch export: {str(e)}")
+        
+        logger.info(f"Batch export completed - Success: {successful_exports}, Failed: {failed_exports}")
+        return successful_exports, failed_exports
+    
+    def _export_single_asset_in_transaction(self, tx, flattened_data: Dict[str, Any], asset_type_name: str) -> bool:
+        """
+        Export a single asset within an existing transaction.
+        
+        Args:
+            tx: Neo4j transaction
+            flattened_data: Flattened asset data
+            asset_type_name: Asset type name
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Get the main node name (Full Name)
+            full_name_key = f"{asset_type_name} Full Name"
+            main_node_name = flattened_data.get(full_name_key)
+            
+            if not main_node_name:
+                logger.error(f"No full name found for asset type: {asset_type_name}")
+                return False
+            
+            # Separate properties and relations
+            node_properties = {}
+            relation_full_names = {}
+            
+            for key, value in flattened_data.items():
+                if value is None or str(value).strip() == '':
+                    continue
+                
+                # Skip responsibility properties - these should not be node properties
+                key_lower = key.lower()
+                if ('user name against' in key_lower or 
+                    'user role against' in key_lower or 
+                    'user email against' in key_lower):
+                    continue
+                
+                # Check if this is a relation property ending with "_Full Name"
+                if self._is_relation_property(key):
+                    # This contains the actual node names for the relation
+                    base_key = key[:-10]  # Remove "_Full Name"
+                    relation_full_names[base_key] = value
+                elif key.endswith(" Full Name") or key.endswith("_Full Name"):
+                    # This is a Full Name property but not a relation (like the main node's Full Name)
+                    continue
+                else:
+                    # Check if this property has a corresponding "_Full Name" property
+                    full_name_key_check = f"{key}_Full Name"
+                    if full_name_key_check in flattened_data:
+                        # This is a relation property, skip it (we'll use the Full Name version)
+                        continue
+                    else:
+                        # Regular node property
+                        node_properties[key] = value
+            
+            # Create or update the main node
+            self._create_or_update_node(tx, main_node_name, asset_type_name, node_properties)
+            
+            # Process relations
+            for relation_key, target_names_str in relation_full_names.items():
+                relation_info = self._extract_relation_info(relation_key)
+                if relation_info:
+                    role_type, target_node_type = relation_info
+                    
+                    if target_names_str:  # Only process if not None or empty
+                        # Split target names by comma and process each
+                        target_names = [name.strip() for name in str(target_names_str).split(',') if name.strip()]
+                        
+                        for target_name in target_names:
+                            # Create target node with minimal properties (just name)
+                            self._create_or_update_node(tx, target_name, target_node_type, {'name': target_name})
+                            
+                            # Create relationship from main node to target node
+                            self._create_relationship(
+                                tx, main_node_name, asset_type_name,
+                                target_name, target_node_type, role_type
+                            )
+            
+            # Process responsibilities (user relationships)
+            responsibilities = self._parse_responsibilities(flattened_data)
+            if responsibilities:
+                self._create_user_relationships(tx, main_node_name, asset_type_name, responsibilities)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in single asset export transaction: {str(e)}")
+            return False
+
     def test_connection(self) -> bool:
         """
         Test the Neo4j database connection.
@@ -380,7 +615,7 @@ class Neo4jExporter:
             bool: True if connection successful
         """
         try:
-            with self.driver.session(database=self.database) as session:
+            with self.get_session() as session:
                 result = session.run("RETURN 1 as test")
                 return result.single()["test"] == 1
         except Exception as e:
@@ -430,6 +665,35 @@ def export_flattened_data_to_neo4j(flattened_data: Dict[str, Any], asset_type_na
     except Exception as e:
         logger.error(f"Error exporting to Neo4j: {str(e)}")
         return False
+
+
+def export_batch_to_neo4j(flattened_batch: List[Dict[str, Any]], asset_type_name: str) -> tuple:
+    """
+    Export a batch of flattened data to Neo4j database in a single transaction.
+    
+    Args:
+        flattened_batch: List of flattened asset data dictionaries
+        asset_type_name: Name of the asset type
+        
+    Returns:
+        tuple: (successful_exports, failed_exports)
+    """
+    if not flattened_batch:
+        return 0, 0
+        
+    try:
+        with create_neo4j_exporter_from_env() as exporter:
+            # Test connection first
+            if not exporter.test_connection():
+                logger.error("Failed to connect to Neo4j database")
+                return 0, len(flattened_batch)
+            
+            # Export the batch
+            return exporter.export_batch_to_neo4j(flattened_batch, asset_type_name)
+            
+    except Exception as e:
+        logger.error(f"Error exporting batch to Neo4j: {str(e)}")
+        return 0, len(flattened_batch)
 
 
 # Integration function to be called from your existing transformer

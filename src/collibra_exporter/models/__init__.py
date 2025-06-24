@@ -9,6 +9,7 @@ from .exporter import (
     Neo4jExporter,
     create_neo4j_exporter_from_env,
     export_flattened_data_to_neo4j,
+    export_batch_to_neo4j,
     integrate_neo4j_export
 )
 
@@ -20,6 +21,7 @@ __all__ = [
     'Neo4jExporter',
     'create_neo4j_exporter_from_env',
     'export_flattened_data_to_neo4j',
+    'export_batch_to_neo4j',
     'integrate_neo4j_export',
     # 'save_data'  # Uncomment if you have this function
 ]

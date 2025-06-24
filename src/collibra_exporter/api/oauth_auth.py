@@ -4,6 +4,8 @@ import logging
 import time
 from dotenv import load_dotenv
 from functools import lru_cache
+# Removed module-level imports to avoid circular dependencies
+# These will be imported locally where needed
 
 load_dotenv(override=True)
 
@@ -20,7 +22,23 @@ class OAuthTokenManager:
 
     def get_valid_token(self):
         """Get a valid OAuth token, refreshing if necessary."""
+        # Import locally to avoid circular dependencies
+        from ..utils.cache_manager import cache_manager
+        from ..utils.performance_monitor import increment_counter
+        
         current_time = time.time()
+        
+        # Check cache first
+        auth_cache = cache_manager.get_auth_cache()
+        cached_token = auth_cache.get("oauth_token")
+        
+        if cached_token and cached_token.get('expiration_time', 0) > (current_time + self._refresh_buffer):
+            increment_counter("auth_cache_hits")
+            self._token = cached_token['token']
+            self._expiration_time = cached_token['expiration_time']
+            return self._token
+        
+        increment_counter("auth_cache_misses")
         
         # Check if token is expired or will expire soon
         if not self._token or current_time >= (self._expiration_time - self._refresh_buffer):
@@ -30,6 +48,10 @@ class OAuthTokenManager:
 
     def _fetch_new_token(self):
         """Fetch a new OAuth token from the server."""
+        # Import locally to avoid circular dependencies
+        from ..utils.cache_manager import cache_manager
+        from ..utils.performance_monitor import increment_counter
+        
         client_id = os.getenv('CLIENT_ID')
         client_secret = os.getenv('CLIENT_SECRET')
         base_url = os.getenv('COLLIBRA_INSTANCE_URL')
@@ -51,7 +73,18 @@ class OAuthTokenManager:
             # Set expiration time based on server response
             self._expiration_time = time.time() + token_data["expires_in"]
             
-            logging.info("Successfully obtained new OAuth token")
+            # Cache the token
+            auth_cache = cache_manager.get_auth_cache()
+            token_cache_data = {
+                'token': self._token,
+                'expiration_time': self._expiration_time
+            }
+            # Cache with TTL slightly less than actual expiration
+            cache_ttl = token_data["expires_in"] - self._refresh_buffer - 10
+            auth_cache.put("oauth_token", token_cache_data, ttl=cache_ttl)
+            increment_counter("auth_tokens_cached")
+            
+            logging.info("Successfully obtained and cached new OAuth token")
             
         except requests.RequestException as e:
             logging.error(f"Error obtaining OAuth token: {e}")
